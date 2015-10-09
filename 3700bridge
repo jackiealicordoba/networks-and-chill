@@ -1,0 +1,335 @@
+#!/usr/bin/python -u
+# The -u makes output unbuffered, so it will show up immediately
+import sys
+import socket
+import select
+import json
+import time
+
+# Bridge ID for this bridge
+id = ""
+# routing_table:
+# {example_host_id: {'port':x, 'age':x},
+# ...}
+routing_table = {}
+# bpdu_data:
+# {'id':x, 'root':x, 'cost':x, 'sent_port':x}
+# bpdu_table:
+# {bridge_id: {'recv_port':x, 'root_id':x, 'cost':x, 'exp_date':x},
+#  ... }
+bpdu_table = {}
+# root_info:
+# {'root':root_id, 'next_id':x, 'cost':x, 'port':port_leading_to_root}
+root_info = {}
+# List of booleans for each port on bridge. True = enabled, False = disabled.
+enabled_port_table = []
+
+routing_row_timeout = 5     # max age in seconds until row must be flushed
+bpdu_timeout = 0.75         # Max age in seconds until row must be flushed
+bpdu_broadcast_delay = 0.5  # min time between regular bpdu broadcasts
+
+time_of_last_bpdu = 0       # Used to track time of last bpdu broadcast
+
+
+# pads the name with null bytes at the end
+def pad(name):
+    result = '\0' + name
+    while len(result) < 108:
+            result += '\0'
+    return result
+
+
+# Enables all ports
+def enable_all_ports():
+    for index in range(len(enabled_port_table)):
+            enabled_port_table[index] = True
+
+
+# Sends data messages to the destination's port if known, else broadcasts.
+def route(msg, data, src_port):
+    src = msg['source']
+    dest = msg['dest']
+    msg_id = msg['message']['id']
+
+    # Update routing table:
+    routing_table[src] = {'port': src_port, 'age': time.time()}
+
+    # Check destination is in routing table (recognized by bridge)
+    if dest in routing_table:
+        # Lookup destination port in routing table
+        dest_port = routing_table[dest]['port']
+        # Check if the destination is on the same port as the message source:
+        if dest_port == src_port:
+            # Drop the package, it is being handled elsewhere on network
+            print("Not forwarding message " + str(msg_id))
+        else:
+            # Send to destination port if it is enabled:
+            if enabled_port_table[dest_port]:
+                print("Forwarding message " +
+                      str(msg_id) + " to port " +
+                      str(dest_port))
+                sockets[dest_port].send(data)
+    else:
+        # Send original data (not Python msg) to all other enabled ports
+        # (other than source)
+        print("Broadcasting message " + str(msg_id) + " to all ports")
+        for s in sockets:
+            port = sockets.index(s)
+            if port != src_port and enabled_port_table[port]:
+                s.send(data)
+
+
+# Removes stale entries from the routing table
+# (if their age > routing_row_timeout)
+def maintain_routing_table():
+    # Use list to store rows to be deleted because you can't
+    # modify a dict as you iterate over it
+    rows_to_delete = []
+    for host in routing_table:
+        if time.time() - routing_table[host]['age'] > routing_row_timeout:
+            rows_to_delete.append(host)
+    for host in rows_to_delete:
+        del routing_table[host]
+
+
+# Check port status for changes
+# (root, designated, disabled), flush table if needed
+# (This function is only called immediately before changing some ports status)
+def flush_routing_table(port, flush_if_status):
+    if flush_if_status == "ENABLED" and enabled_port_table[port]:
+        routing_table.clear()
+        # This happens just before disabling port
+        print("Disabled port: " + str(id) + "/" + str(port))
+    elif flush_if_status == "DISABLED" and not enabled_port_table[port]:
+        routing_table.clear()
+        # This happens just before enabling port
+        print("Designated port: " + str(id) + "/" + str(port))
+    elif flush_if_status == "NOT_ROOT" and root_info['port'] != port:
+        routing_table.clear()
+        # This happens just before setting root port
+        print("Root port: " + str(id) + "/" + str(port))
+    elif flush_if_status == "ROOT" and root_info['port'] == port:
+        routing_table.clear()
+
+
+# Broadcasts BPDU message on all ports
+def bpdu_broadcast():
+    # Construct bpdu message
+    bpdu_data = {'id': root_info['id'],
+                 'root': root_info['root'],
+                 'cost': root_info['cost'],
+                 'sent_port': -1}
+
+    for s in sockets:
+        bpdu_data['sent_port'] = sockets.index(s)
+        bpdu_message = json.dumps({'source': root_info['id'],
+                                   'dest': 'ffff',
+                                   'type': 'bpdu',
+                                   'message': bpdu_data})
+        s.send(bpdu_message)
+    global time_of_last_bpdu
+    time_of_last_bpdu = time.time()
+
+
+# Update root_info with the given parameters
+def update_root_info(root, next_id, cost, port):
+    root_info['root'] = root
+    root_info['next_id'] = next_id
+    root_info['cost'] = cost
+    root_info['port'] = port
+
+# Add or update entries in bpdu_table
+def update_bpdu_table(bpdu_id, recv_port, bpdu_root, bpdu_cost):
+    bpdu_table[bpdu_id] = {'recv_port': recv_port,
+                           'root_id': bpdu_root,
+                           'cost': bpdu_cost,
+                           'exp_date': time.time() + bpdu_timeout}
+
+# Handles incoming BPDU message, updating tree info if necessary
+def bpdu_handle(bpdu, recv_port):
+    bpdu_root = bpdu['root']
+    bpdu_id = bpdu['id']
+    bpdu_cost = bpdu['cost']
+    bpdu_sent_port = bpdu['sent_port']
+
+    global enabled_port_table
+
+    # Received BPDU from own id (Problem!)
+    if id == bpdu_id:
+        # Disable the larger of the two ports (Do nothing if same port)
+        if recv_port > bpdu_sent_port:
+            flush_routing_table(recv_port, "ENABLED")
+            enabled_port_table[recv_port] = False
+        elif recv_port < bpdu_sent_port:
+            flush_routing_table(bpdu_sent_port, "ENABLED")
+            enabled_port_table[bpdu_sent_port] = False
+    # Received BPDU we already received on a different port (Problem!)
+    elif bpdu_id in bpdu_table \
+            and bpdu_table[bpdu_id]['recv_port'] != recv_port:
+        # If we have a LARGER BID, take action
+        if int(id, 16) > int(bpdu_id, 16):
+            # Close the larger of the two ports
+            previous_port = bpdu_table[bpdu_id]['recv_port']
+            if recv_port < previous_port:
+                flush_routing_table(previous_port, "ENABLED")
+                enabled_port_table[previous_port] = False
+                # Update table entry for bpdu_id
+                update_bpdu_table(bpdu_id, recv_port, bpdu_root, bpdu_cost)
+            else:
+                # Refresh the bpdu_table entry for bpdu_id
+                bpdu_table[bpdu_id]['exp_date'] = time.time() + bpdu_timeout
+                flush_routing_table(recv_port, "ENABLED")
+                enabled_port_table[recv_port] = False
+    # Received BPDU with better root
+    elif int(bpdu_root, 16) < int(root_info['root'], 16):
+        # Enable new root port
+        flush_routing_table(recv_port, "DISABLED")
+        enabled_port_table[recv_port] = True
+        enable_all_ports()
+
+        # Update root_info
+        flush_routing_table(recv_port, "NOT_ROOT")
+        update_root_info(bpdu_root, bpdu_id, bpdu_cost + 1, recv_port)
+        # Update bpdu_table for bpdu_id
+        update_bpdu_table(bpdu_id, recv_port, bpdu_root, bpdu_cost)
+        print("New root: " + str(id) + "/" + str(root_info['root']))
+        # Broadcast new root info
+        bpdu_broadcast()
+    # Received BPDU with worse root
+    elif int(bpdu_root, 16) > int(root_info['root'], 16):
+        # Do NOT update root_info
+        # Update bpdu_table for bpdu_id
+        update_bpdu_table(bpdu_id, recv_port, bpdu_root, bpdu_cost)
+        # Enable recv_port for construction phase
+        flush_routing_table(recv_port, "DISABLED")
+        enabled_port_table[recv_port] = True
+    # Received BPDU with same root
+    else:
+        # Update bpdu_table for bpdu_id
+        # (This applies to all cases below)
+        update_bpdu_table(bpdu_id, recv_port, bpdu_root, bpdu_cost)
+
+        # BPDU shows faster route to same root
+        if bpdu_cost < root_info['cost'] - 1:
+            # Enable all ports
+            flush_routing_table(recv_port, "DISABLED")
+            enable_all_ports()
+            # Update root_info
+            flush_routing_table(recv_port, "NOT_ROOT")
+            update_root_info(bpdu_root, bpdu_id, bpdu_cost + 1, recv_port)
+            # Broadcast new root info
+            bpdu_broadcast()
+        # BPDU from new bridge shows same cost as current path to root,
+        # but on different port
+        # (We have two possible paths to the same root)
+        elif bpdu_cost == root_info['cost'] - 1 \
+                and root_info['port'] != recv_port:
+            # Above elif means bpdu_id should not equal root_info['next_id']
+            # If bpdu_id is smaller than next id to root, update root_info
+            if int(bpdu_id, 16) < int(root_info['next_id'], 16):
+                flush_routing_table(root_info['port'], "ENABLED")
+                enabled_port_table[root_info['port']] = False
+                # Enable new root port
+                flush_routing_table(recv_port, "DISABLED")
+                enabled_port_table[recv_port] = True
+                # Update root_info
+                flush_routing_table(recv_port, "NOT_ROOT")
+                update_root_info(bpdu_root, bpdu_id, bpdu_cost + 1, recv_port)
+                # Broadcast new root info
+                bpdu_broadcast()
+            # If BPDU has worse id, disable recv_port
+            else:
+                flush_routing_table(recv_port, "ENABLED")
+                enabled_port_table[recv_port] = False
+
+        # BPDU shows same cost to same root as this bridge (Problem!)
+        # (BPDU sender is parallel node in spanning tree)
+        elif bpdu_cost == root_info['cost'] \
+                and root_info['port'] != recv_port:
+            # If we have LARGER BID, disable port
+            if int(id, 16) > int(bpdu_id, 16):
+                flush_routing_table(recv_port, "ENABLED")
+                enabled_port_table[recv_port] = False
+
+
+# Remove stale BPDU entries from table
+# Reset ports to enabled, update root_info,
+# and broadcast new BPDU info if path to root is flushed.
+def maintain_bpdu_table():
+    # Use list to store rows to be deleted because you can't
+    # modify a dict as you iterate over it
+    rows_to_delete = []
+    for bridge in bpdu_table:
+        if time.time() > bpdu_table[bridge]['exp_date']:
+            rows_to_delete.append(bridge)
+    for bridge in rows_to_delete:
+        # If we lose our path to the root, reset root_info
+        if bridge == root_info['next_id']:
+            flush_routing_table(-1, "NOT_ROOT")
+            update_root_info(id, id, 0, -1)
+            print("New root: " + str(id) + "/" + str(root_info['root']))
+            # Open all ports for future reconfiguration
+            enable_all_ports()
+            # Update neighbors of root change
+            bpdu_broadcast()
+        del bpdu_table[bridge]
+
+if __name__ == "__main__":
+    # BridgeID = first argument to script
+    id = sys.argv[1]
+
+    # Set up default BPDU
+    # Set root_id in root_info to BridgeID
+    root_info['id'] = id
+    update_root_info(id, id, 0, -1)
+
+    # LAN = list of all other arguments to script
+    LAN = sys.argv[2:]
+    sockets = []
+
+    # creates a socket for each LAN and connects to them
+    for x in range(len(LAN)):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        s.connect(pad(LAN[x]))
+        sockets.append(s)
+        enabled_port_table.append(True)
+
+    print "Bridge " + id + " starting up\n"
+
+    # Main loop
+    while True:
+        # Broadcast BPDUs every .5 seconds
+        if time.time() - time_of_last_bpdu >= bpdu_broadcast_delay:
+            bpdu_broadcast()
+
+        # Maintain bpdu_table, remove stale entries
+        # (protect against failing bridges)
+        maintain_bpdu_table()
+
+        # Maintain routing_table, remove stale entries
+        # (protect against failing or moving hosts)
+        maintain_routing_table()
+
+        # Calls select with all the sockets change the timeout value (1)
+        ready, ignore, ignore2 = select.select(sockets, [], [], 0.1)
+
+        # Reads from each of the ready sockets
+        for x in ready:
+            data = x.recv(1500)
+            # Convert JSON message to Python dict
+            msg = json.loads(data)
+            src_port = sockets.index(x)
+
+            # Check if message type is bpdu
+            if msg['type'] == 'bpdu':
+                # Do necessary updates, etc.
+                bpdu_handle(msg['message'], src_port)
+            # Check if message type is data and if the socket is enabled.
+            # If port is not enabled, do not handle received data
+            elif msg['type'] == 'data':
+                if enabled_port_table[src_port]:
+                    # Call route/update_routing(data)
+                    route(msg, data, src_port)
+                else:
+                    # Drop the package, it has a different path to dest
+                    print("Not forwarding message " + str(msg['message']['id']))
